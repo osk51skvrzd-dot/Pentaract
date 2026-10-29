@@ -8,6 +8,7 @@ pub async fn get_pool(
     max_connection: u32,
     timeout: Duration,
 ) -> PgPool {
+    // Не открываем больше двух соединений к PostgreSQL.
     let max_connections = max_connection.clamp(1, 2);
 
     let db = PgPoolOptions::new()
@@ -18,7 +19,7 @@ pub async fn get_pool(
         .expect("can't establish database connection");
 
     tracing::info!(
-        "Database pool established; max connections: {}",
+        "PostgreSQL connection pool established; max connections: {}",
         max_connections
     );
 
