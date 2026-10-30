@@ -182,7 +182,7 @@ impl<'d> FilesService<'d> {
         tokio::task::spawn_blocking(move || {
             let image = image::load_from_memory(&data).ok()?;
 
-            let thumbnail = image.thumbnail(16, 16);
+            let thumbnail = image.thumbnail(64, 64);
 
             let encoder = webp::Encoder::from_image(&thumbnail).ok()?;
 
