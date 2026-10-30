@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+
 use sqlx::{PgPool, QueryBuilder};
 use uuid::Uuid;
 
@@ -212,7 +214,11 @@ impl<'d> FilesRepository<'d> {
                     CASE
                         WHEN $1 || {split_part} = path THEN size
                         ELSE (SELECT SUM(size) FROM {FILES_TABLE} WHERE path LIKE $1 || {split_part} || '/' || '%')::BigInt
-                    END AS size
+                    END AS size,
+                    CASE
+                        WHEN $1 || {split_part} = path THEN thumbnail
+                        ELSE NULL::BYTEA
+                    END AS thumbnail
                 FROM {FILES_TABLE}
                 WHERE storage_id = $2 {path_filter} AND is_uploaded AND {split_part} <> '';
             "
@@ -243,6 +249,9 @@ impl<'d> FilesRepository<'d> {
                     name: el.name,
                     is_file: el.is_file,
                     size: el.size,
+                    thumbnail: el.thumbnail.map(|bytes| {
+                        format!("data:image/webp;base64,{}", STANDARD.encode(bytes))
+                    }),
                 }
             })
             .collect();
@@ -295,6 +304,21 @@ impl<'d> FilesRepository<'d> {
             .fetch_all(self.db)
             .await
             .map_err(|e| map_not_found(e, "file chunks"))
+    }
+
+    pub async fn set_thumbnail(&self, file_id: Uuid, thumbnail: &[u8]) -> PentaractResult<()> {
+        sqlx::query(
+            format!("UPDATE {FILES_TABLE} SET thumbnail = $1 WHERE id = $2").as_str(),
+        )
+        .bind(thumbnail)
+        .bind(file_id)
+        .execute(self.db)
+        .await
+        .map_err(|e| {
+            tracing::error!("failed to save thumbnail: {e}");
+            PentaractError::Unknown
+        })
+        .map(|_| ())
     }
 
     pub async fn set_as_uploaded(&self, file_id: Uuid) -> PentaractResult<()> {
