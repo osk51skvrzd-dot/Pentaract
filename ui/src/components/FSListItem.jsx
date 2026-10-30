@@ -1,3 +1,4 @@
+
 import ListItem from '@suid/material/ListItem'
 import ListItemButton from '@suid/material/ListItemButton'
 import ListItemIcon from '@suid/material/ListItemIcon'
@@ -11,7 +12,7 @@ import MoreVertIcon from '@suid/icons-material/MoreVert'
 import DownloadIcon from '@suid/icons-material/Download'
 import InfoIcon from '@suid/icons-material/Info'
 import DeleteIcon from '@suid/icons-material/Delete'
-import { createSignal } from 'solid-js'
+import { createSignal, Show } from 'solid-js'
 import { useNavigate, useParams } from '@solidjs/router'
 
 import API from '../api'
@@ -26,15 +27,14 @@ import FileInfoDialog from './FileInfo'
  */
 
 /**
- *
  * @param {FSListItemProps} props
- * @returns
  */
 const FSListItem = (props) => {
 	const [moreAnchorEl, setMoreAnchorEl] = createSignal(null)
 	const [isActionConfirmDialogOpened, setIsActionConfirmDialogOpened] =
 		createSignal(false)
 	const [isInfoDialogOpened, setIsInfoDialogOpened] = createSignal(false)
+
 	const navigate = useNavigate()
 	const params = useParams()
 
@@ -51,16 +51,20 @@ const FSListItem = (props) => {
 	}
 
 	const download = async () => {
-		const blob = await API.files.download(params.id, props.fsElement.path)
+		const blob = await API.files.download(
+			params.id,
+			props.fsElement.path
+		)
 
 		const href = URL.createObjectURL(blob)
+
 		const a = Object.assign(document.createElement('a'), {
 			href,
 			style: 'display: none',
 			download: props.fsElement.name,
 		})
-		document.body.appendChild(a)
 
+		document.body.appendChild(a)
 		a.click()
 		URL.revokeObjectURL(href)
 		a.remove()
@@ -70,14 +74,29 @@ const FSListItem = (props) => {
 		handleCloseMore()
 		setIsActionConfirmDialogOpened(true)
 	}
+
 	const closeActionConfirmDialog = () => {
 		setIsActionConfirmDialogOpened(false)
 	}
 
+	// Удаление файла или папки
 	const deleteFile = async () => {
 		closeActionConfirmDialog()
-		await API.files.deleteFile(params.id, props.fsElement.path)
-		props.onDelete()
+
+		let path = props.fsElement.path
+
+		// Папки в базе данных хранятся с "/" в конце пути.
+		// Поэтому добавляем его перед отправкой DELETE-запроса.
+		if (!props.fsElement.is_file) {
+			path = path.replace(/\/+$/, '') + '/'
+		}
+
+		try {
+			await API.files.deleteFile(params.id, path)
+			await props.onDelete()
+		} catch (err) {
+			console.error('Delete error:', err)
+		}
 	}
 
 	return (
@@ -89,8 +108,10 @@ const FSListItem = (props) => {
 							<FileIcon />
 						</Show>
 					</ListItemIcon>
+
 					<ListItemText primary={props.fsElement.name} />
 				</ListItemButton>
+
 				<IconButton
 					onClick={(event) => {
 						setMoreAnchorEl(event.currentTarget)
@@ -99,6 +120,7 @@ const FSListItem = (props) => {
 					<MoreVertIcon />
 				</IconButton>
 			</ListItem>
+
 			<MenuMUI
 				id="basic-menu"
 				anchorEl={moreAnchorEl()}
@@ -115,14 +137,14 @@ const FSListItem = (props) => {
 
 				<MenuItem onClick={download} disabled={!props.fsElement.is_file}>
 					<ListItemIcon>
-						<DownloadIcon fontSize="small" />
+						<DownloadIcon />
 					</ListItemIcon>
 					<ListItemText>Download</ListItemText>
 				</MenuItem>
 
 				<MenuItem onClick={openActionConfirmDialog}>
 					<ListItemIcon>
-						<DeleteIcon fontSize="small" />
+						<DeleteIcon />
 					</ListItemIcon>
 					<ListItemText>Delete</ListItemText>
 				</MenuItem>
