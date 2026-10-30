@@ -256,6 +256,7 @@ const uploadFileTo = async (storage_id, path, file) => {
  * @property {string} name
  * @property {boolean} is_file
  * @property {number} size
+ * @property {string | null} [thumbnail] WebP preview as a data URI, if available
  */
 
 /**
