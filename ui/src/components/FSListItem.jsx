@@ -105,7 +105,22 @@ const FSListItem = (props) => {
 				<ListItemButton onClick={handleNavigate}>
 					<ListItemIcon>
 						<Show when={props.fsElement.is_file} fallback={<FolderIcon />}>
-							<FileIcon />
+							<Show when={props.fsElement.thumbnail} fallback={<FileIcon />}>
+								<img
+									src={props.fsElement.thumbnail}
+									alt=""
+									width="16"
+									height="16"
+									loading="lazy"
+									decoding="async"
+									style={{
+										width: '16px',
+										height: '16px',
+										'object-fit': 'cover',
+										'flex-shrink': '0',
+									}}
+								/>
+							</Show>
 						</Show>
 					</ListItemIcon>
 
