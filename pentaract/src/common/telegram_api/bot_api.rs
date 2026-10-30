@@ -1,12 +1,24 @@
-use reqwest::multipart;
+
+use std::sync::OnceLock;
+
+use reqwest::{multipart, Client};
 use uuid::Uuid;
 
 use crate::{
-    common::types::ChatId, errors::PentaractResult,
+    common::types::ChatId,
+    errors::PentaractResult,
     services::storage_workers_scheduler::StorageWorkersScheduler,
 };
 
 use super::schemas::{DownloadBodySchema, UploadBodySchema, UploadSchema};
+
+// Один HTTP-клиент на всё приложение.
+// reqwest::Client можно безопасно переиспользовать.
+static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+
+fn http_client() -> &'static Client {
+    HTTP_CLIENT.get_or_init(Client::new)
+}
 
 pub struct TelegramBotApi<'t> {
     base_url: &'t str,
@@ -14,7 +26,10 @@ pub struct TelegramBotApi<'t> {
 }
 
 impl<'t> TelegramBotApi<'t> {
-    pub fn new(base_url: &'t str, scheduler: StorageWorkersScheduler<'t>) -> Self {
+    pub fn new(
+        base_url: &'t str,
+        scheduler: StorageWorkersScheduler<'t>,
+    ) -> Self {
         Self {
             base_url,
             scheduler,
@@ -28,33 +43,34 @@ impl<'t> TelegramBotApi<'t> {
         storage_id: Uuid,
     ) -> PentaractResult<UploadSchema> {
         let chat_id = {
-            // inserting 100 between minus sign and chat id
-            // cause telegram devs are complete retards and it works this way only
-            //
-            // https://stackoverflow.com/a/65965402/12255756
-
+            // Вставляем 100 между минусом и ID чата.
             let n = chat_id.abs().checked_ilog10().unwrap_or(0) + 1;
+
             chat_id - (100 * ChatId::from(10).pow(n))
         };
 
         let token = self.scheduler.get_token(storage_id).await?;
+
         let url = self.build_url("", "sendDocument", token);
 
-        let file_part = multipart::Part::bytes(file.to_vec()).file_name("pentaract_chunk.bin");
+        let file_part = multipart::Part::bytes(file.to_vec())
+            .file_name("pentaract_chunk.bin");
+
         let form = multipart::Form::new()
             .text("chat_id", chat_id.to_string())
             .part("document", file_part);
 
-        let response = reqwest::Client::new()
+        let response = http_client()
             .post(url)
             .multipart(form)
             .send()
             .await?;
 
         match response.error_for_status() {
-            // https://stackoverflow.com/a/32679930/12255756
-            Ok(r) => Ok(r.json::<UploadBodySchema>().await?.result.document),
-            Err(e) => Err(e.into()),
+            Ok(response) => {
+                Ok(response.json::<UploadBodySchema>().await?.result.document)
+            }
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -63,33 +79,45 @@ impl<'t> TelegramBotApi<'t> {
         telegram_file_id: &str,
         storage_id: Uuid,
     ) -> PentaractResult<Vec<u8>> {
-        // getting file path
+        // 1. Получаем путь к файлу
         let token = self.scheduler.get_token(storage_id).await?;
+
         let url = self.build_url("", "getFile", token);
-        // TODO: add retries with their number taking from env
-        let body: DownloadBodySchema = reqwest::Client::new()
+
+        let body: DownloadBodySchema = http_client()
             .get(url)
             .query(&[("file_id", telegram_file_id)])
             .send()
             .await?
+            .error_for_status()?
             .json()
             .await?;
 
-        // downloading the file itself
+        // 2. Скачиваем сам файл
         let token = self.scheduler.get_token(storage_id).await?;
+
         let url = self.build_url("file/", &body.result.file_path, token);
-        let file = reqwest::get(url)
+
+        let response = http_client()
+            .get(url)
+            .send()
             .await?
-            .bytes()
-            .await
-            .map(|file| file.to_vec())?;
+            .error_for_status()?;
+
+        let file = response.bytes().await?.to_vec();
 
         Ok(file)
     }
 
-    /// Taking token by a value to force dropping it so it can be used only once
+    /// Создаёт URL Telegram API.
+    /// Token передаётся по значению.
     #[inline]
-    fn build_url(&self, pre: &str, relative: &str, token: String) -> String {
+    fn build_url(
+        &self,
+        pre: &str,
+        relative: &str,
+        token: String,
+    ) -> String {
         format!("{}/{pre}bot{token}/{relative}", self.base_url)
     }
 }
