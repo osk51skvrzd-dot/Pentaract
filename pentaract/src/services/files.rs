@@ -1,425 +1,335 @@
-use std::path::Path;
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-
-use sqlx::{PgPool, QueryBuilder};
+use axum::body::Bytes;
+use sqlx::PgPool;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
-use crate::common::db::errors::map_not_found;
-use crate::errors::{PentaractError, PentaractResult};
-use crate::models::file_chunks::FileChunk;
-use crate::models::files::{DBFSElement, FSElement, File, InFile, SearchFSElement};
+use crate::{
+    common::{
+        access::check_access,
+        channels::{
+            ClientData, ClientMessage, ClientSender, DownloadFileData, StorageManagerData,
+            UploadFileData,
+        },
+        jwt_manager::AuthUser,
+    },
+    errors::{PentaractError, PentaractResult},
+    models::{
+        access::AccessType,
+        files::{FSElement, File, InFile, SearchFSElement},
+    },
+    repositories::{
+        access::AccessRepository, files::FilesRepository,
+        storage_workers::StorageWorkersRepository,
+    },
+    schemas::files::{InFileSchema, InFolderSchema},
+};
 
-pub const FILES_TABLE: &str = "files";
-pub const CHUNKS_TABLE: &str = "file_chunks";
-
-/// General repo for files and chunks since they share common logic
-pub struct FilesRepository<'d> {
-    db: &'d PgPool,
+pub struct FilesService<'d> {
+    repo: FilesRepository<'d>,
+    storage_workers_repo: StorageWorkersRepository<'d>,
+    access_repo: AccessRepository<'d>,
+    tx: ClientSender,
 }
 
-impl<'d> FilesRepository<'d> {
-    pub fn new(db: &'d PgPool) -> Self {
-        Self { db }
+impl<'d> FilesService<'d> {
+    pub fn new(db: &'d PgPool, tx: ClientSender) -> Self {
+        Self {
+            repo: FilesRepository::new(db),
+            storage_workers_repo: StorageWorkersRepository::new(db),
+            access_repo: AccessRepository::new(db),
+            tx,
+        }
     }
 
-    pub async fn create_file(&self, in_obj: InFile) -> PentaractResult<File> {
-        self._create_file(in_obj, false).await
-    }
-
-    pub async fn create_folder(&self, in_obj: InFile) -> PentaractResult<File> {
-        self._create_file(in_obj, true).await
-    }
-
-    async fn _create_file(&self, in_obj: InFile, is_uploaded: bool) -> PentaractResult<File> {
-        let id = Uuid::new_v4();
-
-        sqlx::query(
-            format!(
-                "
-                INSERT INTO {FILES_TABLE} (id, path, size, storage_id, is_uploaded)
-                VALUES ($1, $2, $3, $4, $5);
-            "
-            )
-            .as_str(),
+    pub async fn create_folder(
+        &self,
+        in_schema: InFolderSchema,
+        user: &AuthUser,
+    ) -> PentaractResult<()> {
+        check_access(
+            &self.access_repo,
+            user.id,
+            in_schema.storage_id,
+            &AccessType::W,
         )
-        .bind(id)
-        .bind(&in_obj.path)
-        .bind(in_obj.size)
-        .bind(in_obj.storage_id)
-        .bind(is_uploaded)
-        .execute(self.db)
-        .await
-        .map_err(|e| match e {
-            sqlx::Error::Database(dbe) if dbe.is_foreign_key_violation() => {
-                PentaractError::DoesNotExist("such storage".to_string())
-            }
-            sqlx::Error::Database(dbe) if dbe.is_unique_violation() => {
-                PentaractError::AlreadyExists("File with such name".to_string())
-            }
-            _ => {
-                tracing::error!("{e}");
-                PentaractError::Unknown
-            }
-        })?;
+        .await?;
 
-        let storage = File::new(id, in_obj.path, in_obj.size, in_obj.storage_id, false);
-        Ok(storage)
-    }
+        if !Self::validate_filepath(&in_schema.parent_path) {
+            return Err(PentaractError::InvalidPath);
+        }
 
-    /// Creates a file even if the given path already exists
-    pub async fn create_file_anyway(&self, in_obj: InFile) -> PentaractResult<File> {
-        let id = Uuid::new_v4();
+        if in_schema.folder_name.contains('/') {
+            return Err(PentaractError::InvalidFolderName);
+        }
 
-        // lol/kek/sdf.nj.dskf/sdkl.fdsklf/lol .kek.dsf
-        let (path_with_stem, suffix) = {
-            let mut splited_path: Vec<_> = in_obj.path.split("/").collect();
-            let last = splited_path.last_mut().unwrap();
-            let mut suffix = String::new();
-            (*last, suffix) = last
-                .split_once(".")
-                .map(|(stem, suffix)| (stem, format!(".{suffix}")))
-                .unwrap_or((last, "".to_owned()));
-            (splited_path.join("/"), suffix)
+        let path = if !in_schema.parent_path.is_empty() {
+            format!("{}/{}/", in_schema.parent_path, in_schema.folder_name)
+        } else {
+            format!("{}/", in_schema.folder_name)
         };
 
-        println!("{path_with_stem} {suffix}");
+        let in_file = InFile::new(path, 0, in_schema.storage_id);
 
-        let chars_to_skip = path_with_stem.len() + 3; // if the name is `kek` then it's gonna be a len of `kek (` + 1
-        let skip_chars_from_back = chars_to_skip + suffix.len();
-
-        // https://www.db-fiddle.com/f/i6XCvTSi5cpAVu5AAfiNqm/16
-        sqlx::query_as(
-            format!(
-                r#"
-                INSERT INTO files (path, storage_id, id, size, is_uploaded)
-                WITH f AS (
-                    SELECT path
-                    FROM {FILES_TABLE}
-                    WHERE storage_id = $3 AND path ~ ('^(' || regexp_quote($1) || regexp_quote($2) || '|' || regexp_quote($1) || ' \(\d+\)' || regexp_quote($2) || ')$')
-                    ORDER BY path DESC
-                )
-                SELECT
-                    CASE
-                        WHEN NOT EXISTS(
-                            SELECT path
-                            FROM f
-                            WHERE path = $1 || $2
-                        ) THEN $1 || $2
-                        ELSE
-                            CASE
-                                WHEN COUNT(f) > 1 THEN (
-                                    WITH cte AS (
-                                        SELECT *
-                                        FROM (
-                                            SELECT SUBSTRING(f.path, {chars_to_skip}, LENGTH(f.path) - {skip_chars_from_back})::numeric AS i
-                                            FROM f
-                                            WHERE f.path != $1 || $2
-                                        ) AS n
-                                        WHERE i > 0
-                                        ORDER BY i
-                                    )
-                                    SELECT $1 || ' (' || COALESCE(t.next_i, (
-                                        SELECT cte.i + 1
-                                        FROM cte
-                                        ORDER BY cte.i DESC
-                                        LIMIT 1
-                                    )) || ')' || $2
-                                    FROM cte
-                                    FULL OUTER JOIN (
-                                        SELECT prev_i + 1 AS next_i
-                                        FROM (
-                                            SELECT LAG(i, 1, 0) OVER() AS prev_i, i
-                                            FROM cte
-                                        ) t
-                                        WHERE prev_i != t.i - 1
-                                        LIMIT 1
-                                    ) t ON cte.i = t.next_i
-                                    LIMIT 1
-                                )
-                                WHEN COUNT(f) = 1 THEN $1 || ' (1)' || $2
-                                ELSE $1 || $2
-                            END
-                    END,
-                    $3,
-                    $4,
-                    $5,
-                    false
-                FROM f
-                RETURNING *;
-            "#
-            )
-            .as_str(),
-        )
-        .bind(&path_with_stem)
-        .bind(&suffix)
-        .bind(in_obj.storage_id)
-        .bind(id)
-        .bind(in_obj.size)
-        .fetch_one(self.db)
-        .await
-        .map_err(|e| match e {
-            sqlx::Error::Database(dbe) if dbe.is_foreign_key_violation() => {
-                PentaractError::DoesNotExist("such storage".to_string())
-            }
-            _ => {
-                tracing::error!("{e}");
-                PentaractError::Unknown
-            }
-        })
+        self.repo.create_folder(in_file).await.map(|_| ())
     }
 
-    pub async fn create_chunks_batch(&self, chunks: Vec<FileChunk>) -> PentaractResult<()> {
-        QueryBuilder::new(
-            format!("INSERT INTO {CHUNKS_TABLE} (id, file_id, telegram_file_id, position)")
-                .as_str(),
+    pub async fn upload_to(
+        &self,
+        in_schema: InFileSchema,
+        user: &AuthUser,
+    ) -> PentaractResult<()> {
+        check_access(
+            &self.access_repo,
+            user.id,
+            in_schema.storage_id,
+            &AccessType::W,
         )
-        .push_values(chunks, |mut q, chunk| {
-            q.push_bind(chunk.id)
-                .push_bind(chunk.file_id)
-                .push_bind(chunk.telegram_file_id)
-                .push_bind(chunk.position);
-        })
-        .build()
-        .execute(self.db)
-        .await
-        .map_err(|_| PentaractError::Unknown)?;
+        .await?;
+
+        self.check_storage_workers(in_schema.storage_id).await?;
+
+        if !Self::validate_filepath(&in_schema.path) {
+            return Err(PentaractError::InvalidPath);
+        }
+
+        let in_file = InFile::new(
+            in_schema.path,
+            in_schema.size,
+            in_schema.storage_id,
+        );
+
+        let file = self.repo.create_file(in_file).await?;
+
+        self._upload(file, in_schema.file, user).await
+    }
+
+    pub async fn upload_anyway(
+        &self,
+        in_file: InFile,
+        file_data: Bytes,
+        user: &AuthUser,
+    ) -> PentaractResult<()> {
+        check_access(
+            &self.access_repo,
+            user.id,
+            in_file.storage_id,
+            &AccessType::W,
+        )
+        .await?;
+
+        self.check_storage_workers(in_file.storage_id).await?;
+
+        let file = self.repo.create_file_anyway(in_file).await?;
+
+        self._upload(file, file_data, user).await
+    }
+
+    async fn _upload(
+        &self,
+        file: File,
+        file_data: Bytes,
+        user: &AuthUser,
+    ) -> PentaractResult<()> {
+        // Generate thumbnail separately.
+        // Thumbnail errors must never interrupt original file upload.
+        let thumbnail = Self::generate_thumbnail(file_data.to_vec()).await;
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+
+        let upload_file_data = UploadFileData {
+            file_id: file.id,
+            user_id: user.id,
+            file_data: file_data.as_ref().into(),
+        };
+
+        let message = ClientMessage {
+            data: ClientData::UploadFile(upload_file_data),
+            tx: resp_tx,
+        };
+
+        tracing::debug!("sending task to manager");
+
+        let _ = self.tx.send(message).await;
+
+        let message_back = match resp_rx.await.unwrap().data {
+            StorageManagerData::UploadFile(r) => r,
+            _ => unimplemented!(),
+        };
+
+        if let Err(e) = message_back.and({
+            tracing::debug!("file loaded successfully");
+            self.repo.set_as_uploaded(file.id).await
+        }) {
+            tracing::error!("{e}");
+
+            let _ = self.repo.delete_with_folders(file.id).await;
+
+            return Err(e);
+        }
+
+        // Save thumbnail only after successful upload.
+        if let Some(thumbnail) = thumbnail {
+            if let Err(e) = self.repo.set_thumbnail(file.id, &thumbnail).await {
+                tracing::warn!("Could not save thumbnail: {e}");
+            }
+        }
 
         Ok(())
     }
 
-    /// NOTE:
-    ///
-    /// `prefix` must be without leading and trailing slashes
-    pub async fn list_dir(
+    async fn generate_thumbnail(data: Vec<u8>) -> Option<Vec<u8>> {
+        tokio::task::spawn_blocking(move || {
+            let image = image::load_from_memory(&data).ok()?;
+
+            let thumbnail = image.thumbnail(16, 16);
+
+            let encoder = webp::Encoder::from_image(&thumbnail).ok()?;
+
+            Some(encoder.encode(20.0).to_vec())
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn check_storage_workers(
         &self,
         storage_id: Uuid,
-        prefix: &str,
-    ) -> PentaractResult<Vec<FSElement>> {
-        let query = {
-            let adding_to_position = !prefix.is_empty() as usize + 1;
-            let split_position = prefix.matches("/").count() + adding_to_position;
-            let split_part = format!("SPLIT_PART(path, '/', {split_position})");
-            let path_filter = if prefix.is_empty() {
-                ""
-            } else {
-                "AND path LIKE $1 || '%'"
-            };
-
-            format!(
-                "
-                SELECT
-                    DISTINCT {split_part} AS name,
-                    $1 || {split_part} = path AS is_file,
-                    CASE
-                        WHEN $1 || {split_part} = path THEN size
-                        ELSE (SELECT SUM(size) FROM {FILES_TABLE} WHERE path LIKE $1 || {split_part} || '/' || '%')::BigInt
-                    END AS size,
-                    CASE
-                        WHEN $1 || {split_part} = path THEN thumbnail
-                        ELSE NULL::BYTEA
-                    END AS thumbnail
-                FROM {FILES_TABLE}
-                WHERE storage_id = $2 {path_filter} AND is_uploaded AND {split_part} <> '';
-            "
-            )
-        };
-
-        let prefix = if prefix.is_empty() {
-            prefix.to_string()
+    ) -> PentaractResult<()> {
+        if !self.storage_workers_repo.storage_has_any(storage_id).await? {
+            Err(PentaractError::StorageDoesNotHaveWorkers)
         } else {
-            format!("{prefix}/")
+            Ok(())
+        }
+    }
+
+    pub async fn download(
+        &self,
+        path: &str,
+        storage_id: Uuid,
+        user: &AuthUser,
+    ) -> PentaractResult<Vec<u8>> {
+        check_access(
+            &self.access_repo,
+            user.id,
+            storage_id,
+            &AccessType::R,
+        )
+        .await?;
+
+        if !Self::validate_path(path) {
+            return Err(PentaractError::InvalidPath);
+        }
+
+        let file = self.repo.get_file_by_path(path, storage_id).await?;
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+
+        let download_file_data = DownloadFileData {
+            file_id: file.id,
+            storage_id,
+            user_id: user.id,
         };
 
-        let fs_layer = sqlx::query_as::<_, DBFSElement>(&query)
-            .bind(&prefix)
-            .bind(storage_id)
-            .fetch_all(self.db)
-            .await
-            .map_err(|e| {
-                tracing::error!("{e}");
-                PentaractError::Unknown
-            })?;
-        let fs_layer = fs_layer
-            .into_iter()
-            .map(|el| {
-                let path = format!("{prefix}{}", el.name);
-                FSElement {
-                    path,
-                    name: el.name,
-                    is_file: el.is_file,
-                    size: el.size,
-                    thumbnail: el.thumbnail.map(|bytes| {
-                        format!("data:image/webp;base64,{}", STANDARD.encode(bytes))
-                    }),
-                }
-            })
-            .collect();
+        let message = ClientMessage {
+            data: ClientData::DownloadFile(download_file_data),
+            tx: resp_tx,
+        };
 
-        Ok(fs_layer)
+        tracing::debug!("sending task to manager");
+
+        let _ = self.tx.send(message).await;
+
+        match resp_rx.await.unwrap().data {
+            StorageManagerData::DownloadFile(r) => r,
+            _ => unimplemented!(),
+        }
+    }
+
+    pub async fn list_dir(
+        self,
+        storage_id: Uuid,
+        path: &str,
+        user: &AuthUser,
+    ) -> PentaractResult<Vec<FSElement>> {
+        check_access(
+            &self.access_repo,
+            user.id,
+            storage_id,
+            &AccessType::R,
+        )
+        .await?;
+
+        self.repo.list_dir(storage_id, path).await
     }
 
     pub async fn search(
-        &self,
-        search_path: &str,
-        path: &str,
+        self,
         storage_id: Uuid,
+        path: &str,
+        search_path: &str,
+        user: &AuthUser,
     ) -> PentaractResult<Vec<SearchFSElement>> {
-        sqlx::query_as(
-            format!(
-                "SELECT
-                    path,
-                    path LIKE '%/' AS is_file
-                FROM {FILES_TABLE}
-                WHERE storage_id = $1 AND path ILIKE $2 || '%' || $3 || '%'
-            "
-            )
-            .as_str(),
+        check_access(
+            &self.access_repo,
+            user.id,
+            storage_id,
+            &AccessType::R,
         )
-        .bind(storage_id)
-        .bind(path)
-        .bind(search_path)
-        .fetch_all(self.db)
-        .await
-        .map_err(|e| {
-            tracing::error!("{e}");
-            PentaractError::Unknown
-        })
+        .await?;
+
+        self.repo.search(search_path, path, storage_id).await
     }
 
-    pub async fn get_file_by_path(&self, path: &str, storage_id: Uuid) -> PentaractResult<File> {
-        sqlx::query_as(
-            format!("SELECT * FROM {FILES_TABLE} WHERE storage_id = $1 AND path = $2").as_str(),
-        )
-        .bind(storage_id)
-        .bind(path)
-        .fetch_one(self.db)
-        .await
-        .map_err(|e| map_not_found(e, "file"))
-    }
-
-    pub async fn list_chunks_of_file(&self, file_id: Uuid) -> PentaractResult<Vec<FileChunk>> {
-        sqlx::query_as(format!("SELECT * FROM {CHUNKS_TABLE} WHERE file_id = $1").as_str())
-            .bind(file_id)
-            .fetch_all(self.db)
-            .await
-            .map_err(|e| map_not_found(e, "file chunks"))
-    }
-
-    pub async fn set_thumbnail(&self, file_id: Uuid, thumbnail: &[u8]) -> PentaractResult<()> {
-        sqlx::query(
-            format!("UPDATE {FILES_TABLE} SET thumbnail = $1 WHERE id = $2").as_str(),
-        )
-        .bind(thumbnail)
-        .bind(file_id)
-        .execute(self.db)
-        .await
-        .map_err(|e| {
-            tracing::error!("failed to save thumbnail: {e}");
-            PentaractError::Unknown
-        })
-        .map(|_| ())
-    }
-
-    pub async fn set_as_uploaded(&self, file_id: Uuid) -> PentaractResult<()> {
-        sqlx::query(format!("UPDATE {FILES_TABLE} SET is_uploaded = true WHERE id = $1").as_str())
-            .bind(file_id)
-            .execute(self.db)
-            .await
-            .map_err(|_| PentaractError::Unknown)
-            .map(|_| ())
-    }
-
-    pub async fn update_path(
+    pub async fn rename(
         &self,
         old_path: &str,
         new_path: &str,
         storage_id: Uuid,
+        user: &AuthUser,
     ) -> PentaractResult<()> {
-        let chars_skip = old_path.len();
-
-        sqlx::query(
-            format!(
-                "
-                UPDATE {FILES_TABLE}
-                SET path = $1 || SUBSTRING(path, {chars_skip})
-                WHERE storage_id = $2 AND path LIKE $3 || '%'
-            "
-            )
-            .as_str(),
+        check_access(
+            &self.access_repo,
+            user.id,
+            storage_id,
+            &AccessType::W,
         )
-        .bind(new_path)
-        .bind(old_path)
-        .bind(storage_id)
-        .execute(self.db)
-        .await
-        .map_err(|_| PentaractError::Unknown)
-        .map(|_| ())
-    }
+        .await?;
 
-    pub async fn delete_with_folders(&self, id: Uuid) -> PentaractResult<()> {
-        sqlx::query(format!("DELETE FROM {FILES_TABLE} WHERE id = $1").as_str())
-            .bind(id)
-            .execute(self.db)
-            .await
-            .map_err(|_| PentaractError::Unknown)
-            .map(|_| ())
-    }
-
-    pub async fn delete(&self, path: &str, storage_id: Uuid) -> PentaractResult<()> {
-        let mut transaction = self.db.begin().await.map_err(|e| map_not_found(e, ""))?;
-
-        let where_path = if path.ends_with("/") {
-            // for folders
-            "LIKE $2 || '%'"
-        } else {
-            // for files
-            "= $2"
-        };
-
-        // deleting file
-        sqlx::query(&format!(
-            "
-            DELETE FROM {FILES_TABLE}
-            WHERE storage_id = $1 AND path {where_path};
-            "
-        ))
-        .bind(storage_id)
-        .bind(path)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|e| map_not_found(e, "file"))?;
-
-        // creating a folder if it was the file in the folder
-        if let Some(parent) = Path::new(path).parent().map(|path| path.to_str().unwrap()) {
-            let new_id = Uuid::new_v4();
-            let parent = format!("{parent}/");
-
-            sqlx::query(&format!(
-                "
-                INSERT INTO {FILES_TABLE} (id, path, size, storage_id, is_uploaded)
-                SELECT $1, $2, 0, $3, true
-                WHERE
-                    NOT EXISTS (
-                        SELECT id
-                        FROM {FILES_TABLE}
-                        WHERE storage_id = $3 AND path LIKE $2 || '%'
-                    );
-            "
-            ))
-            .bind(new_id)
-            .bind(parent)
-            .bind(storage_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|e| map_not_found(e, "some entity"))?;
+        if !Self::validate_path(old_path) || !Self::validate_path(new_path) {
+            return Err(PentaractError::InvalidPath);
         }
 
-        transaction
-            .commit()
-            .await
-            .map_err(|e| map_not_found(e, ""))?;
+        self.repo.update_path(old_path, new_path, storage_id).await
+    }
 
-        Ok(())
+    pub async fn delete(
+        &self,
+        path: &str,
+        storage_id: Uuid,
+        user: &AuthUser,
+    ) -> PentaractResult<()> {
+        check_access(
+            &self.access_repo,
+            user.id,
+            storage_id,
+            &AccessType::W,
+        )
+        .await?;
+
+        if !Self::validate_path(path) {
+            return Err(PentaractError::InvalidPath);
+        }
+
+        self.repo.delete(path, storage_id).await
+    }
+
+    fn validate_filepath(path: &str) -> bool {
+        Self::validate_path(path) && !path.ends_with('/')
+    }
+
+    fn validate_path(path: &str) -> bool {
+        !path.starts_with('/') && !path.contains("//")
     }
 }
