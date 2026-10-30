@@ -131,8 +131,8 @@ impl<'d> FilesService<'d> {
         file_data: Bytes,
         user: &AuthUser,
     ) -> PentaractResult<()> {
-        // Generate thumbnail separately.
-        // Thumbnail errors must never interrupt original file upload.
+        // Создаём миниатюру отдельно от загрузки оригинала.
+        // Ошибка миниатюры не должна прерывать загрузку файла.
         let thumbnail = Self::generate_thumbnail(file_data.to_vec()).await;
 
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -168,7 +168,7 @@ impl<'d> FilesService<'d> {
             return Err(e);
         }
 
-        // Save thumbnail only after successful upload.
+        // Сохраняем миниатюру после успешной загрузки оригинала.
         if let Some(thumbnail) = thumbnail {
             if let Err(e) = self.repo.set_thumbnail(file.id, &thumbnail).await {
                 tracing::warn!("Could not save thumbnail: {e}");
@@ -178,6 +178,7 @@ impl<'d> FilesService<'d> {
         Ok(())
     }
 
+    // Размер создаваемой миниатюры: 64x64 пикселя.
     async fn generate_thumbnail(data: Vec<u8>) -> Option<Vec<u8>> {
         tokio::task::spawn_blocking(move || {
             let image = image::load_from_memory(&data).ok()?;
