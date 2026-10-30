@@ -116,6 +116,10 @@ pub async fn init_db(db: &PgPool) {
         );
     ",
         "
+        ALTER TABLE files
+        ADD COLUMN IF NOT EXISTS thumbnail BYTEA;
+    ",
+        "
         CREATE TABLE IF NOT EXISTS file_chunks (
             id               UUID         PRIMARY KEY,
             file_id          UUID         NOT NULL REFERENCES files 
