@@ -14,7 +14,6 @@ import InfoIcon from '@suid/icons-material/Info'
 import DeleteIcon from '@suid/icons-material/Delete'
 import { createSignal, Show } from 'solid-js'
 import { useNavigate, useParams } from '@solidjs/router'
-
 import API from '../api'
 import ActionConfirmDialog from './ActionConfirmDialog'
 import FileInfoDialog from './FileInfo'
@@ -30,157 +29,159 @@ import FileInfoDialog from './FileInfo'
  * @param {FSListItemProps} props
  */
 const FSListItem = (props) => {
-	const [moreAnchorEl, setMoreAnchorEl] = createSignal(null)
-	const [isActionConfirmDialogOpened, setIsActionConfirmDialogOpened] =
-		createSignal(false)
-	const [isInfoDialogOpened, setIsInfoDialogOpened] = createSignal(false)
+    const [moreAnchorEl, setMoreAnchorEl] = createSignal(null)
 
-	const navigate = useNavigate()
-	const params = useParams()
+    const [isActionConfirmDialogOpened, setIsActionConfirmDialogOpened] =
+        createSignal(false)
 
-	const openMore = () => Boolean(moreAnchorEl())
+    const [isInfoDialogOpened, setIsInfoDialogOpened] = createSignal(false)
 
-	const handleCloseMore = () => {
-		setMoreAnchorEl(null)
-	}
+    const navigate = useNavigate()
+    const params = useParams()
 
-	const handleNavigate = () => {
-		if (!props.fsElement.is_file) {
-			navigate(`/storages/${props.storageId}/files/${props.fsElement.path}`)
-		}
-	}
+    const openMore = () => Boolean(moreAnchorEl())
 
-	const download = async () => {
-		const blob = await API.files.download(
-			params.id,
-			props.fsElement.path
-		)
+    const handleCloseMore = () => {
+        setMoreAnchorEl(null)
+    }
 
-		const href = URL.createObjectURL(blob)
+    const handleNavigate = () => {
+        if (!props.fsElement.is_file) {
+            navigate(`/storages/${props.storageId}/files/${props.fsElement.path}`)
+        }
+    }
 
-		const a = Object.assign(document.createElement('a'), {
-			href,
-			style: 'display: none',
-			download: props.fsElement.name,
-		})
+    const download = async () => {
+        const blob = await API.files.download(
+            params.id,
+            props.fsElement.path
+        )
 
-		document.body.appendChild(a)
-		a.click()
-		URL.revokeObjectURL(href)
-		a.remove()
-	}
+        const href = URL.createObjectURL(blob)
 
-	const openActionConfirmDialog = () => {
-		handleCloseMore()
-		setIsActionConfirmDialogOpened(true)
-	}
+        const a = Object.assign(document.createElement('a'), {
+            href,
+            style: 'display: none',
+            download: props.fsElement.name,
+        })
 
-	const closeActionConfirmDialog = () => {
-		setIsActionConfirmDialogOpened(false)
-	}
+        document.body.appendChild(a)
+        a.click()
+        URL.revokeObjectURL(href)
+        a.remove()
+    }
 
-	// Удаление файла или папки
-	const deleteFile = async () => {
-		closeActionConfirmDialog()
+    const openActionConfirmDialog = () => {
+        handleCloseMore()
+        setIsActionConfirmDialogOpened(true)
+    }
 
-		let path = props.fsElement.path
+    const closeActionConfirmDialog = () => {
+        setIsActionConfirmDialogOpened(false)
+    }
 
-		// Папки в базе данных хранятся с "/" в конце пути.
-		// Поэтому добавляем его перед отправкой DELETE-запроса.
-		if (!props.fsElement.is_file) {
-			path = path.replace(/\/+$/, '') + '/'
-		}
+    // Удаление файла или папки
+    const deleteFile = async () => {
+        closeActionConfirmDialog()
 
-		try {
-			await API.files.deleteFile(params.id, path)
-			await props.onDelete()
-		} catch (err) {
-			console.error('Delete error:', err)
-		}
-	}
+        let path = props.fsElement.path
 
-	return (
-		<>
-			<ListItem disablePadding>
-				<ListItemButton onClick={handleNavigate}>
-					<ListItemIcon>
-						<Show when={props.fsElement.is_file} fallback={<FolderIcon />}>
-							<Show when={props.fsElement.thumbnail} fallback={<FileIcon />}>
-								<img
-									src={props.fsElement.thumbnail}
-									alt=""
-									width="16"
-									height="16"
-									loading="lazy"
-									decoding="async"
-									style={{
-										width: '16px',
-										height: '16px',
-										'object-fit': 'cover',
-										'flex-shrink': '0',
-									}}
-								/>
-							</Show>
-						</Show>
-					</ListItemIcon>
+        // Папки в базе данных хранятся с "/" в конце пути.
+        // Поэтому добавляем его перед отправкой DELETE-запроса.
+        if (!props.fsElement.is_file) {
+            path = path.replace(/\/+$/, '') + '/'
+        }
 
-					<ListItemText primary={props.fsElement.name} />
-				</ListItemButton>
+        try {
+            await API.files.deleteFile(params.id, path)
+            await props.onDelete()
+        } catch (err) {
+            console.error('Delete error:', err)
+        }
+    }
 
-				<IconButton
-					onClick={(event) => {
-						setMoreAnchorEl(event.currentTarget)
-					}}
-				>
-					<MoreVertIcon />
-				</IconButton>
-			</ListItem>
+    return (
+        <>
+            <ListItem disablePadding>
+                <ListItemButton onClick={handleNavigate}>
+                    <ListItemIcon>
+                        <Show when={props.fsElement.is_file} fallback={<FolderIcon />}>
+                            <Show when={props.fsElement.thumbnail} fallback={<FileIcon />}>
+                                <img
+                                    src={props.fsElement.thumbnail}
+                                    alt=""
+                                    width="64"
+                                    height="64"
+                                    loading="lazy"
+                                    decoding="async"
+                                    style={{
+                                        width: '64px',
+                                        height: '64px',
+                                        'object-fit': 'cover',
+                                        'flex-shrink': '0',
+                                    }}
+                                />
+                            </Show>
+                        </Show>
+                    </ListItemIcon>
 
-			<MenuMUI
-				id="basic-menu"
-				anchorEl={moreAnchorEl()}
-				open={openMore()}
-				onClose={handleCloseMore}
-				MenuListProps={{ 'aria-labelledby': 'basic-button' }}
-			>
-				<MenuItem onClick={() => setIsInfoDialogOpened(true)}>
-					<ListItemIcon>
-						<InfoIcon fontSize="small" />
-					</ListItemIcon>
-					<ListItemText>Info</ListItemText>
-				</MenuItem>
+                    <ListItemText primary={props.fsElement.name} />
+                </ListItemButton>
 
-				<MenuItem onClick={download} disabled={!props.fsElement.is_file}>
-					<ListItemIcon>
-						<DownloadIcon />
-					</ListItemIcon>
-					<ListItemText>Download</ListItemText>
-				</MenuItem>
+                <IconButton
+                    onClick={(event) => {
+                        setMoreAnchorEl(event.currentTarget)
+                    }}
+                >
+                    <MoreVertIcon />
+                </IconButton>
+            </ListItem>
 
-				<MenuItem onClick={openActionConfirmDialog}>
-					<ListItemIcon>
-						<DeleteIcon />
-					</ListItemIcon>
-					<ListItemText>Delete</ListItemText>
-				</MenuItem>
-			</MenuMUI>
+            <MenuMUI
+                id="basic-menu"
+                anchorEl={moreAnchorEl()}
+                open={openMore()}
+                onClose={handleCloseMore}
+                MenuListProps={{ 'aria-labelledby': 'basic-button' }}
+            >
+                <MenuItem onClick={() => setIsInfoDialogOpened(true)}>
+                    <ListItemIcon>
+                        <InfoIcon fontSize="small" />
+                    </ListItemIcon>
+                    <ListItemText>Info</ListItemText>
+                </MenuItem>
 
-			<ActionConfirmDialog
-				action="Delete"
-				entity="file"
-				actionDescription={`delete file ${props.fsElement.name}`}
-				isOpened={isActionConfirmDialogOpened()}
-				onConfirm={deleteFile}
-				onCancel={closeActionConfirmDialog}
-			/>
+                <MenuItem onClick={download} disabled={!props.fsElement.is_file}>
+                    <ListItemIcon>
+                        <DownloadIcon />
+                    </ListItemIcon>
+                    <ListItemText>Download</ListItemText>
+                </MenuItem>
 
-			<FileInfoDialog
-				file={props.fsElement}
-				isOpened={isInfoDialogOpened()}
-				onClose={() => setIsInfoDialogOpened(false)}
-			/>
-		</>
-	)
+                <MenuItem onClick={openActionConfirmDialog}>
+                    <ListItemIcon>
+                        <DeleteIcon />
+                    </ListItemIcon>
+                    <ListItemText>Delete</ListItemText>
+                </MenuItem>
+            </MenuMUI>
+
+            <ActionConfirmDialog
+                action="Delete"
+                entity="file"
+                actionDescription={`delete file ${props.fsElement.name}`}
+                isOpened={isActionConfirmDialogOpened()}
+                onConfirm={deleteFile}
+                onCancel={closeActionConfirmDialog}
+            />
+
+            <FileInfoDialog
+                file={props.fsElement}
+                isOpened={isInfoDialogOpened()}
+                onClose={() => setIsInfoDialogOpened(false)}
+            />
+        </>
+    )
 }
 
 export default FSListItem
