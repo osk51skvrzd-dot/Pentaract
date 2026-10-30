@@ -48,6 +48,7 @@ pub struct DBFSElement {
     pub name: String,
     pub size: i64,
     pub is_file: bool,
+    pub thumbnail: Option<Vec<u8>>,
 }
 
 #[derive(Debug, sqlx::FromRow, Serialize)]
@@ -56,6 +57,7 @@ pub struct FSElement {
     pub name: String,
     pub size: i64,
     pub is_file: bool,
+    pub thumbnail: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow, Serialize)]
