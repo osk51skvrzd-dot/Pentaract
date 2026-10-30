@@ -111,9 +111,14 @@ pub async fn init_db(db: &PgPool) {
                                             ON DELETE CASCADE 
                                             ON UPDATE CASCADE,
             is_uploaded bool         NOT NULL,
+            thumbnail   BYTEA,
 
             UNIQUE (path, storage_id)
         );
+    ",
+        "
+        ALTER TABLE files
+        ADD COLUMN IF NOT EXISTS thumbnail BYTEA;
     ",
         "
         CREATE TABLE IF NOT EXISTS file_chunks (
